@@ -53,14 +53,43 @@ def dims(path):
 
 
 # ---------------------------------------------------------------- words
-def load_whisper(model_name):
-    from faster_whisper import WhisperModel
+def gpu_ready():
+    """An NVIDIA GPU that faster-whisper can really use. On Windows the CUDA 12 libraries (pip packages
+    nvidia-cublas-cu12 / nvidia-cudnn-cu12) are often installed but not on PATH: add their folders, then test-load."""
+    if os.environ.get("WHISPER_DEVICE") == "cpu":
+        return False
     try:
         import ctranslate2
-        if ctranslate2.get_cuda_device_count() > 0:
-            return WhisperModel(model_name or "large-v3", device="cuda", compute_type="float16"), "cuda"
+        if ctranslate2.get_cuda_device_count() == 0:
+            return False
     except Exception:  # noqa: BLE001
-        pass
+        return False
+    if os.name != "nt":
+        return True
+    import ctypes
+    import site
+    for base in site.getsitepackages() + [site.getusersitepackages()]:
+        for sub in ("nvidia/cublas/bin", "nvidia/cudnn/bin"):
+            d = os.path.join(base, sub)
+            if os.path.isdir(d):
+                with contextlib.suppress(OSError):
+                    os.add_dll_directory(d)
+                os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+    try:
+        ctypes.WinDLL("cublas64_12.dll")
+        ctypes.WinDLL("cudnn_ops64_9.dll")
+        return True
+    except OSError:
+        return False
+
+
+def load_whisper(model_name, cpu=False):
+    from faster_whisper import WhisperModel
+    if not cpu and gpu_ready():
+        try:
+            return WhisperModel(model_name or "large-v3", device="cuda", compute_type="float16"), "cuda"
+        except Exception as e:  # noqa: BLE001
+            print("GPU load failed, using the CPU:", e, flush=True)
     return WhisperModel(model_name or "medium", device="cpu", compute_type="int8"), "cpu"
 
 
@@ -79,9 +108,16 @@ def transcribe(audio_src, workdir, lang, model_name, label):
         lock = contextlib.nullcontext()
     try:
         with lock:
-            model, dev = load_whisper(model_name)
-            segs, _ = model.transcribe(str(even), language=lang, word_timestamps=True, vad_filter=True, beam_size=5)
-            out = [{"s": round(s.start, 2), "e": round(s.end, 2), "t": s.text.strip()} for s in segs if s.text.strip()]
+            def words(cpu=False):
+                model, dev = load_whisper(model_name, cpu)
+                segs, _ = model.transcribe(str(even), language=lang, word_timestamps=True, vad_filter=True, beam_size=5)
+                return [{"s": round(s.start, 2), "e": round(s.end, 2), "t": s.text.strip()}
+                        for s in segs if s.text.strip()], dev
+            try:
+                out, dev = words()
+            except RuntimeError as e:                   # e.g. a CUDA library missing: it only shows when decoding starts
+                print("GPU transcription failed, retrying on the CPU:", e, flush=True)
+                out, dev = words(cpu=True)
     finally:
         even.unlink(missing_ok=True)
     print(f"whisper on {dev}: {len(out)} lines", flush=True)
@@ -211,22 +247,77 @@ def player_area(video, aspect=None):
     return bx, by, min(int(bw), sw - bx) // 2 * 2, min(int(bh), sh - by) // 2 * 2
 
 
+def longest_run(on):
+    """(first, last) index of the longest stretch of True values, or (0, -1)."""
+    best, i = (0, -1), 0
+    while i < len(on):
+        if on[i]:
+            j = i
+            while j + 1 < len(on) and on[j + 1]:
+                j += 1
+            if j - i > best[1] - best[0]:
+                best = (i, j)
+            i = j + 1
+        else:
+            i += 1
+    return best
+
+
+def bright_area(video, aspect):
+    """Second guess for the player area: the part of the screen that is not dark on most frames (players show black
+    bars around the picture), snapped to the render's shape. Works even when the video was paused most of the time."""
+    sw, sh = dims(video)
+    r = run(["ffmpeg", "-v", "error", "-i", str(video), "-vf", "fps=0.5,scale=192:108,format=gray", "-f", "rawvideo", "-"])
+    a = np.frombuffer(r.stdout, np.uint8)
+    a = a[: len(a) // (192 * 108) * 192 * 108].reshape(-1, 108, 192)
+    if len(a) < 2:
+        return None
+    bars = float(np.percentile(np.median(a, 0), 10))  # how dark the player's bars are (VLC: ~16 of 255)
+    lit = (a > max(20.0, bars + 6)).mean(0) > 0.5     # pixels brighter than the bars on most frames
+    colp = lit.mean(0)
+    if colp.max() <= 0:
+        return None
+    c0, c1 = longest_run(colp > 0.5 * colp.max())    # the picture's columns (bars beside it are dark)
+    if c1 - c0 < 4:
+        return None
+    inside = lit[:, c0:c1 + 1].mean(1)
+    out_cols = np.r_[0:max(0, c0 - 2), min(192, c1 + 3):192]
+    outside = lit[:, out_cols].mean(1) if len(out_cols) else np.zeros(108)
+    r0, r1 = longest_run((inside > 0.5) & (outside < 0.3))   # skip title / menu / control bars across the window
+    if r1 - r0 < 4:
+        return None
+    fx, fy = sw / 192, sh / 108
+    bx, by = c0 * fx, r0 * fy
+    bw, bh = (c1 - c0 + 1) * fx, (r1 - r0 + 1) * fy
+    if bw / bh > aspect * 1.05:
+        nw = bh * aspect
+        bx, bw = bx + (bw - nw) / 2, nw
+    elif bw / bh < aspect / 1.05:
+        nh = bw / aspect
+        by, bh = by + (bh - nh) / 2, nh
+    bx, by = max(0, int(bx)), max(0, int(by))
+    return bx, by, min(int(bw), sw - bx) // 2 * 2, min(int(bh), sh - by) // 2 * 2
+
+
 def match(video, render):
+    """For every half second of the recording: (time, best matching second of the render, match score 0-1).
+    Tries a few guesses of where the player sits on screen and keeps the one that matches best."""
     rw, rh = dims(render)
     W, H = (36, 64) if rh > rw else (64, 36)       # compare at the render's own shape
     ref = norm(small(render, 4, W=W, H=H))
-    box = player_area(video, rw / rh)
-    full = norm(small(video, 2))
-    if box:
+    sw, sh = dims(video)
+    boxes = [b for b in (player_area(video, rw / rh), bright_area(video, rw / rh)) if b]
+    if (W, H) == (64, 36):
+        boxes.append((0, 0, sw // 2 * 2, sh // 2 * 2))            # full screen (a full-screen 16:9 player)
+    best_box, best = None, None
+    for box in dict.fromkeys(boxes):
         win = norm(small(video, 2, f"crop={box[2]}:{box[3]}:{box[0]}:{box[1]},", W=W, H=H))
-        full = win if (W, H) != (64, 36) else full  # a squashed full screen can't match a 9:16 render
-    else:
-        win = full
-    out = []
-    for i in range(min(len(full), len(win))):
-        best = max(((float((ref @ L[i]).max()), int((ref @ L[i]).argmax()) / 4) for L in (full, win)))
-        out.append((i / 2, best[1], best[0]))
-    return out, box
+        sc = win @ ref.T                                          # (recording half-seconds) x (render quarter-seconds)
+        out = [(i / 2, int(sc[i].argmax()) / 4, float(sc[i].max())) for i in range(len(sc))]
+        good = sum(1 for o in out if o[2] > 0.8)
+        if best is None or good > best[0]:
+            best_box, best = box, (good, out)
+    return (best[1] if best else []), best_box
 
 
 def at(mapping, t):
