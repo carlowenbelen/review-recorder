@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+review_settings.json
+review_console_log.txt
+*.mp4
+*.mov
+*.wav
+*.flac
+* review/
+tests/*.jsonl

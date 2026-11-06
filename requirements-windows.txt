@@ -1,0 +1,4 @@
+-r requirements-reader.txt
+psutil
+pyaudiowpatch
+pystray
