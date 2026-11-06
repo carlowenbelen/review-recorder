@@ -84,8 +84,13 @@ counts missed frames and the sound / picture offset in a recording of them.
 
 ## Status
 
-Built and tested on Windows 11 (AMD + NVIDIA laptop) in November 2026. The reader is plain Python + ffmpeg and is
-written for macOS too, but has not been run on a Mac yet. Issues and fixes welcome.
+Built and tested on Windows 11 (AMD + NVIDIA laptop) in November 2026:
+- a 9-minute review of a 9:16 video in a wide VLC window: 99 of 107 comments matched to the right second;
+- a 75-second Mac-style recording (constant frame rate .mov, video paused most of the time) read on the CPU with
+  `--model small` in 33 s: every comment matched.
+
+The reader is plain Python + ffmpeg and is written for macOS too, but has not been run on a Mac yet.
+Issues and fixes welcome.
 
 ## License
 
